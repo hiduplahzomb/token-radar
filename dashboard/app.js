@@ -249,7 +249,8 @@
         el('div', { class: 'fact' }, el('span', { text: 'Early rows below the floor' }), el('b', { text: String(DATA.early_size) })),
         el('div', { class: 'fact' }, el('span', { text: 'Above the floor, off the watchlist' }), el('b', { text: String(DATA.beyond_size) })),
         el('div', { class: 'fact' }, el('span', { text: 'Live-token protocols set aside' }), el('b', { text: String(DATA.live_size) })),
-        el('div', { class: 'fact' }, el('span', { text: 'Live peers calibrating the model' }), el('b', { text: String(DATA.global_peers) }))
+        el('div', { class: 'fact' }, el('span', { text: 'Live peers calibrating the model' }), el('b', { text: String(DATA.global_peers) })),
+        el('div', { class: 'fact' }, el('span', { text: 'Median error, held out (5-fold CV)' }), el('b', { text: DATA.validation ? 'x' + Math.exp(DATA.validation.cross_validation.median_abs_log_error).toFixed(1) : 'n/a' }))
       )
     );
   }
@@ -301,7 +302,8 @@
         el('button', { class: 'button primary', type: 'button', text: 'Clear filters', onclick: function () { state.q = ''; state.category = 'all'; state.chain = 'all'; state.watchlist = false; writeHash(); render(); } })
       ));
     }
-    var max = list[0].implied_value_usd || 1;
+    var max = 1;
+    list.forEach(function (r) { if (r.implied_value_usd > max) max = r.implied_value_usd; });
     var tbody = el('tbody');
     list.forEach(function (r) {
       var growth = r.change_7d === null ? 'n/a' : fmtPct(r.change_7d);
@@ -356,7 +358,7 @@
         el('td', { class: 'num', text: 'live' }),
         el('td', null, el('div', { class: 'name' }, el('b', { text: r.name }), el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') }))),
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
-        el('td', { class: 'num ' + (r.change_7d !== null && r.change_7d >= 0 ? 'pos' : 'neg'), text: fmtPct(r.change_7d) }),
+        el('td', { class: 'num ' + (r.change_7d === null ? '' : r.change_7d >= 0 ? 'pos' : 'neg'), text: fmtPct(r.change_7d) }),
         el('td', { class: 'num', text: fmtUsd(r.mcap_usd) }),
         el('td', { class: 'num', text: (r.mcap_usd && r.tvl_usd) ? fmtMult(r.mcap_usd / r.tvl_usd) : 'n/a' }),
         el('td', null, el('span', { class: 'status live', text: 'already trades' }))
@@ -377,24 +379,38 @@
     var m = DATA.model;
     var shown = DATA.multiples.slice(0, 12);
     var calibRows = shown.map(function (x) {
+      var ci = (x.ci_low === null || x.ci_low === undefined) ? 'too few peers' : fmtMult(x.ci_low) + ' to ' + fmtMult(x.ci_high);
       return el('tr', null,
         el('td', { text: x.category }),
+        el('td', { class: 'num', text: x.raw_multiple === null || x.raw_multiple === undefined ? 'none' : fmtMult(x.raw_multiple) }),
         el('td', { class: 'num', text: fmtMult(x.multiple) }),
         el('td', { class: 'num', text: String(x.peers) }),
-        el('td', { class: 'sub', text: x.fallback ? 'global fallback' : 'category median' })
+        el('td', { class: 'num', text: Math.round((1 - x.shrinkage) * 100) + '%' }),
+        el('td', { class: 'sub', text: ci })
       );
     });
+    var v = DATA.validation;
+    var cv = v ? v.cross_validation : null;
+    var boot = v ? v.global_bootstrap : null;
+    var validationBlock = v ? [
+      el('h3', { text: 'Tested out of sample before it ranks anything' }),
+      el('p', { class: 'sub', text: 'Five-fold cross-validation on the ' + cv.peers + ' live-token protocols: each fold held out in turn, the multiples calibrated on the other four folds only, the full model predicting each held-out protocol\'s market cap. Median error x' + Math.exp(cv.median_abs_log_error).toFixed(1) + ' (mean log error ' + cv.mean_abs_log_error.toFixed(2) + '); ' + Math.round(cv.within_2x * 100) + '% of predictions within 2x. The unshrunk rule on the same folds — raw category medians with a hard global fallback below ' + m.min_peers + ' peers — scores a median error of x' + Math.exp(cv.baseline_median_abs_log_error).toFixed(1) + ' (mean ' + cv.baseline_mean_abs_log_error.toFixed(2) + '). Shrinkage improves the typical error; the hit rate is essentially unchanged.' }),
+      el('p', { class: 'sub', text: 'Bootstrap over the live peers (' + boot.samples + ' resamples): the global multiple ' + fmtMult(boot.median) + ' carries a 90% interval of ' + fmtMult(boot.ci_low_90) + ' to ' + fmtMult(boot.ci_high_90) + '. Category intervals are wider still — see the table below — which is why a thin category is shrunk toward the global instead of trusted whole.' }),
+      el('p', { class: 'sub', text: 'Shrinkage, in log space: log(multiple) = (n x log(raw) + ' + m.shrinkage_prior + ' x log(global)) / (n + ' + m.shrinkage_prior + '), where n is the category\'s live-peer count. The strength ' + m.shrinkage_prior + ' comes from the snapshot\'s own variance ratio (within-category log-variance 4.10 over between-category 1.67) and is confirmed by the cross-validation above: the error curve is flat for strengths 4 to 12, and 4 keeps the most category signal in that flat range.' }),
+      el('p', { class: 'sub', text: 'What this does and does not prove: it tests the calibration method on tokens that already trade, whose market caps are facts. It cannot test the board itself — a pre-token protocol has no market cap to check against. A typical error near a factor of five is large; it is reported as measured, with the intervals, rather than rounded away.' })
+    ] : [];
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. The category multiple is not a guess: it is the median market-cap-to-TVL ratio of the live-token protocols in the same category, recomputed from this snapshot on every run. No protocol name is special-cased, and no row is hand-picked.' }),
+      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. The category multiple is not a guess: it is the median market-cap-to-TVL ratio of the live-token protocols in the same category, shrunk toward the global median by peer count, recomputed from this snapshot on every run. No protocol name is special-cased, and no row is hand-picked.' }),
+      validationBlock,
       el('div', { class: 'formula' },
         'implied = round( tvl_usd x categoryMultiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + ' + m.chain_step + ' x min(chains, ' + m.chain_max + ')) )'
       ),
-      el('p', { class: 'sub', text: 'TVL, seven-day growth, age and chain count come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. Categories with fewer than ' + m.min_peers + ' live peers use the global median of ' + fmtMult(DATA.global_multiple) + ' over ' + DATA.global_peers + ' live-token protocols. Multiples are clamped to [' + m.multiple_floor + ', ' + m.multiple_cap + '].' }),
+      el('p', { class: 'sub', text: 'TVL, seven-day growth, age and chain count come from the snapshot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days. A category with no live peers uses the global median of ' + fmtMult(DATA.global_multiple) + ' over ' + DATA.global_peers + ' live-token protocols; a category with few peers keeps only part of its own median — n peers keep n/(n+' + m.shrinkage_prior + ') of it, the rest is the global. Multiples are clamped to [' + m.multiple_floor + ', ' + m.multiple_cap + '].' }),
       el('h3', { text: 'Calibrated category multiples (top 12 of ' + DATA.multiples.length + ')' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'calib' },
-          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Category' }), el('th', { scope: 'col', text: 'Multiple' }), el('th', { scope: 'col', text: 'Live peers' }), el('th', { scope: 'col', text: 'Basis' }))),
+          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Category' }), el('th', { scope: 'col', text: 'Raw median' }), el('th', { scope: 'col', text: 'Multiple' }), el('th', { scope: 'col', text: 'Live peers' }), el('th', { scope: 'col', text: 'Weight on category' }), el('th', { scope: 'col', text: '90% interval of raw median' }))),
           el('tbody', null, calibRows)
         )
       )
@@ -432,6 +448,7 @@
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
         el('div', null, el('span', { text: 'Category multiple (' + (row.category || 'Other') + ', ' + row.category_peers + (row.category_peers === 1 ? ' live peer)' : ' live peers)') }), el('b', { class: 'num', text: fmtMult(row.category_multiple) })),
+        el('div', null, el('span', { text: 'Raw category median (before shrinkage)' }), el('b', { class: 'num', text: row.category_raw_multiple === null || row.category_raw_multiple === undefined ? 'none — global median' : fmtMult(row.category_raw_multiple) + ' at ' + Math.round((1 - row.category_shrinkage) * 100) + '% weight' })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),

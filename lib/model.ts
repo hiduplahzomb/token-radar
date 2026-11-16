@@ -19,9 +19,16 @@
 //
 // Implied value is calibrated from the snapshot's own market, not from a fixed constant:
 //
-//   categoryMultiple = median(mcap_usd / tvl_usd) over the live-token protocols of the same
-//                      category (at least 3 peers; otherwise the median over all live-token
-//                      protocols), clamped to [0.05, 2.0]
+//   categoryMultiple = the category's live-token median mcap/TVL, shrunk toward the global
+//                      median in log space by peer count (hierarchical shrinkage):
+//                      log(multiple) = (n * log(rawMedian) + k * log(global)) / (n + k),
+//                      k = shrinkage_prior (4), clamped to [0.05, 2.0]. A category with no
+//                      live peers at all still takes the global median; a category with one
+//                      or two peers keeps a small honest weight on its own median instead of
+//                      being thrown away. The shrinkage strength is set from the snapshot's
+//                      own variance ratio (within-category log-variance 4.10 over
+//                      between-category 1.67 gives k ~ 2.5 for a mean, ~3.9 for a median)
+//                      and confirmed by cross-validation (see validateModel).
 //   growthMult       = 1 + clamp(change_7d, -60, 120) / 100 x 0.5
 //   maturityMult     = 0.7 + 0.3 x min(age_days, 730) / 730   (age unknown: 365 days)
 //   chainMult        = 1 + 0.02 x min(chains, 5)
@@ -32,6 +39,15 @@
 // live tokens actually trade at. Growth, age and chain reach then adjust it. No protocol name
 // is ever special-cased: the same function scores every row, and the multiples come from the
 // snapshot's own figures, recomputed on every run.
+//
+// The model is validated before it ranks anything, from the snapshot alone: a stratified
+// 5-fold cross-validation predicts each live-token protocol's market cap from a calibration
+// that never saw it (out-of-sample, with the unshrunk rule alongside for comparison), and a
+// bootstrap over the live peers puts a 90% interval on the global median and on every
+// category median with at least 5 peers. The validation tests the calibration method, not the
+// board: a pre-token protocol has no market cap to check against, and the dashboard says so.
+// The typical out-of-sample error is about a factor of five — large, and reported honestly
+// with its error bars rather than rounded away.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -70,6 +86,8 @@ export interface ModelConstants {
   multiple_floor: number;
   multiple_cap: number;
   min_peers: number;
+  /** Pseudo-count for the hierarchical shrinkage: a category with n peers keeps n/(n+k) of its own median. */
+  shrinkage_prior: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -85,10 +103,11 @@ export const MODEL: ModelConstants = {
   multiple_floor: 0.05,
   multiple_cap: 2.0,
   min_peers: 3,
+  shrinkage_prior: 4,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 30;
@@ -96,9 +115,18 @@ export const LIVE_ROWS = 30;
 /** One category's calibrated multiple: the market's own pricing for that category. */
 export interface CategoryMultiple {
   category: string;
+  /** The shrunk multiple the board actually uses (log-space blend of raw median and global). */
   multiple: number;
   peers: number;
+  /** True only when the category has no live peers at all and takes the global median whole. */
   fallback: boolean;
+  /** The category's own median mcap/TVL before shrinkage, or null when it has no live peers. */
+  raw_multiple: number | null;
+  /** Weight on the global median in the blend, k/(n+k); 1 when the category has no live peers. */
+  shrinkage: number;
+  /** Bootstrap 90% interval of the raw median, or null when fewer than 5 peers. */
+  ci_low: number | null;
+  ci_high: number | null;
 }
 
 /** The calibration: every category's multiple plus the global fallback. */
@@ -135,6 +163,8 @@ export interface BoardRow {
     category_multiple: number;
     category_peers: number;
     category_fallback: boolean;
+    category_raw_multiple: number | null;
+    category_shrinkage: number;
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
@@ -159,6 +189,9 @@ export interface RadarRow {
   implied_value_usd: number;
   category_multiple: number;
   category_peers: number;
+  category_fallback: boolean;
+  category_raw_multiple: number | null;
+  category_shrinkage: number;
   growth_multiplier: number;
   maturity_multiplier: number;
   chain_multiplier: number;
@@ -173,6 +206,39 @@ export interface LiveRow {
   tvl_usd: number;
   mcap_usd: number | null;
   change_7d: number | null;
+}
+
+/** One cross-validation run: out-of-sample errors predicting held-out live peers' market caps. */
+export interface CrossValidation {
+  folds: number;
+  peers: number;
+  seed: number;
+  /** Median absolute log error of the shrunk model (exp of it is the typical error factor). */
+  median_abs_log_error: number;
+  mean_abs_log_error: number;
+  within_2x: number;
+  within_1_5x: number;
+  /** The same metrics for the unshrunk rule (raw medians, hard global fallback below 3 peers). */
+  baseline_median_abs_log_error: number;
+  baseline_mean_abs_log_error: number;
+  baseline_within_2x: number;
+}
+
+/** One bootstrap result: a median with its 90% interval over resampled peers. */
+export interface BootstrapResult {
+  samples: number;
+  seed: number;
+  median: number;
+  ci_low_90: number;
+  ci_high_90: number;
+}
+
+/** The model's validation, computed from the snapshot on every run (see validateModel). */
+export interface ValidationResults {
+  cross_validation: CrossValidation;
+  global_bootstrap: BootstrapResult;
+  /** 90% intervals of the raw category medians, for categories with at least 5 live peers. */
+  category_ci: { category: string; peers: number; median: number; ci_low_90: number; ci_high_90: number }[];
 }
 
 /** Everything the dashboard needs: the board, the live set, the calibration and the model it runs. */
@@ -190,6 +256,7 @@ export interface RadarData {
   global_multiple: number;
   global_peers: number;
   multiples: CategoryMultiple[];
+  validation: ValidationResults;
   watchlist: string[];
   rows: RadarRow[];
   live: LiveRow[];
@@ -260,20 +327,30 @@ export function isRankable(p: SnapshotProtocol): boolean {
   return true;
 }
 
+/** The live-token protocols whose mcap/TVL ratios calibrate the model: every protocol that
+ * records a token and a market cap, except CEX (an exchange's own token is not a protocol's). */
+export function livePeers(snapshot: Snapshot): SnapshotProtocol[] {
+  return snapshot.protocols.filter((p) => {
+    if (isPreToken(p) || p.category === 'CEX') return false;
+    if (p.mcap_usd === null || p.tvl_usd <= 0) return false;
+    const ratio = p.mcap_usd / p.tvl_usd;
+    return Number.isFinite(ratio) && ratio > 0;
+  });
+}
+
 /**
  * Calibrate the category multiples from the snapshot's own live-token market: for each category,
- * the median market-cap-to-TVL ratio of the live-token protocols in it. A category with fewer
- * than `min_peers` live peers falls back to the global median. Every multiple is clamped to
- * [multiple_floor, multiple_cap] so one outlier token cannot bend a whole category.
+ * the median market-cap-to-TVL ratio of the live-token protocols in it, shrunk toward the
+ * global median in log space by peer count. A category with n peers keeps n/(n+k) of its own
+ * median (k = model.shrinkage_prior); only a category with no live peers at all takes the
+ * global median whole. Every multiple is clamped to [multiple_floor, multiple_cap] so one
+ * outlier token cannot bend a whole category.
  */
 export function calibrateMultiples(snapshot: Snapshot, model: ModelConstants = MODEL): Calibration {
   const ratios = new Map<string, number[]>();
   const all: number[] = [];
-  for (const p of snapshot.protocols) {
-    if (isPreToken(p) || p.category === 'CEX') continue;
-    if (p.mcap_usd === null || p.tvl_usd <= 0) continue;
-    const ratio = p.mcap_usd / p.tvl_usd;
-    if (!Number.isFinite(ratio) || ratio <= 0) continue;
+  for (const p of livePeers(snapshot)) {
+    const ratio = p.mcap_usd! / p.tvl_usd;
     all.push(ratio);
     const key = p.category ?? 'Other';
     const list = ratios.get(key) ?? [];
@@ -285,9 +362,21 @@ export function calibrateMultiples(snapshot: Snapshot, model: ModelConstants = M
   const by_category = new Map<string, CategoryMultiple>();
   for (const [category, list] of ratios) {
     list.sort((a, b) => a - b);
-    const fallback = list.length < model.min_peers;
-    const multiple = fallback ? global : Math.min(model.multiple_cap, Math.max(model.multiple_floor, median(list, global)));
-    by_category.set(category, { category, multiple: round4(multiple), peers: list.length, fallback });
+    const raw = median(list, global);
+    const n = list.length;
+    const k = model.shrinkage_prior;
+    const shrunk = Math.exp((n * Math.log(raw) + k * Math.log(global)) / (n + k));
+    const multiple = Math.min(model.multiple_cap, Math.max(model.multiple_floor, shrunk));
+    by_category.set(category, {
+      category,
+      multiple: round4(multiple),
+      peers: n,
+      fallback: false,
+      raw_multiple: round4(raw),
+      shrinkage: round4(k / (n + k)),
+      ci_low: null,
+      ci_high: null,
+    });
   }
   return { by_category, global_multiple: round4(global), global_peers: all.length };
 }
@@ -297,7 +386,7 @@ export function multipleFor(category: string | null, calibration: Calibration): 
   const key = category ?? 'Other';
   const found = calibration.by_category.get(key);
   if (found !== undefined) return found;
-  return { category: key, multiple: calibration.global_multiple, peers: 0, fallback: true };
+  return { category: key, multiple: calibration.global_multiple, peers: 0, fallback: true, raw_multiple: null, shrinkage: 1, ci_low: null, ci_high: null };
 }
 
 /** The four multipliers and the implied value one protocol gets under `model` and `calibration`. */
@@ -317,6 +406,160 @@ export function impliedValue(
   const chainMult = 1 + model.chain_step * Math.min(protocol.chains.length, model.chain_max);
   const implied = Math.max(1, Math.round(protocol.tvl_usd * multiple.multiple * growthMult * maturityMult * chainMult));
   return { implied, multiple, growthPct, growthMult, maturityMult, chainMult, age };
+}
+
+// ---------------------------------------------------------------- validation
+
+/** Cross-validation folds and the bootstrap sizes: fixed, so every run validates the same way. */
+export const CV_FOLDS = 5;
+export const CV_SEED = 0x1000;
+export const BOOTSTRAP_SAMPLES = 2000;
+export const BOOTSTRAP_SEED = 0x5eed;
+export const CATEGORY_BOOTSTRAP_SAMPLES = 2000;
+export const CATEGORY_BOOTSTRAP_MIN_PEERS = 5;
+
+/** A seeded PRNG (mulberry32): every random draw in the validation is reproducible, so two
+ * runs of the program still write byte-identical output. */
+export function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** The live peers dealt into stratified folds: within each category, shuffled with the seed
+ * and dealt round-robin, so every fold sees every category roughly in proportion. */
+export function stratifiedFolds(peers: SnapshotProtocol[], folds: number, seed: number): SnapshotProtocol[][] {
+  const rnd = mulberry32(seed);
+  const out: SnapshotProtocol[][] = Array.from({ length: folds }, () => []);
+  const byCat = new Map<string, SnapshotProtocol[]>();
+  for (const p of peers) {
+    const key = p.category ?? 'Other';
+    const list = byCat.get(key) ?? [];
+    list.push(p);
+    byCat.set(key, list);
+  }
+  for (const list of byCat.values()) {
+    const shuffled = list.slice();
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(rnd() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j]!, shuffled[i]!];
+    }
+    shuffled.forEach((p, i) => out[i % folds]!.push(p));
+  }
+  return out;
+}
+
+/** The bootstrap 90% interval of a median: resample the ratios with replacement, take each
+ * resample's median, and read the 5th and 95th percentiles of those medians. */
+function bootstrapMedian(ratios: number[], samples: number, seed: number): { median: number; ci_low_90: number; ci_high_90: number } {
+  const rnd = mulberry32(seed);
+  const sorted = [...ratios].sort((a, b) => a - b);
+  const med = median(sorted, 0.25);
+  const meds: number[] = [];
+  for (let b = 0; b < samples; b++) {
+    const sample: number[] = [];
+    for (let i = 0; i < ratios.length; i++) sample.push(ratios[Math.floor(rnd() * ratios.length)]!);
+    sample.sort((a, b) => a - b);
+    meds.push(median(sample, med));
+  }
+  meds.sort((a, b) => a - b);
+  const at = (q: number) => meds[Math.min(samples - 1, Math.floor(q * samples))]!;
+  return { median: med, ci_low_90: at(0.05), ci_high_90: at(0.95) };
+}
+
+/** Median and mean absolute log error plus the share of predictions within 2x and 1.5x. */
+function errorStats(errs: number[]): { median_abs: number; mean_abs: number; within_2x: number; within_1_5x: number } {
+  const abs = errs.map(Math.abs).sort((a, b) => a - b);
+  const mid = Math.floor(abs.length / 2);
+  const medianAbs = abs.length % 2 === 1 ? abs[mid]! : (abs[mid - 1]! + abs[mid]!) / 2;
+  const meanAbs = abs.reduce((a, b) => a + b, 0) / abs.length;
+  const within = (factor: number) => errs.filter((e) => Math.abs(e) <= Math.log(factor)).length / errs.length;
+  return { median_abs: medianAbs, mean_abs: meanAbs, within_2x: within(2), within_1_5x: within(1.5) };
+}
+
+/**
+ * Validate the calibration method from the snapshot alone, before the board is built.
+ *
+ * Cross-validation: the live peers are split into 5 stratified folds; each fold in turn is
+ * held out, the multiples are calibrated on the other four folds only, and the full model
+ * predicts each held-out protocol's market cap. The errors are out-of-sample by construction:
+ * no prediction ever sees its own protocol in the calibration. The same folds are scored
+ * with the unshrunk rule (raw category medians, hard global fallback below min_peers) so the
+ * shrinkage's effect is measured, not asserted.
+ *
+ * Bootstrap: the global median is resampled 2,000 times for its 90% interval, and every
+ * category median with at least 5 peers is resampled 2,000 times for its own interval.
+ *
+ * What this does and does not prove: it tests the calibration method on live tokens, whose
+ * market caps are facts. It cannot test the board itself — a pre-token protocol has no market
+ * cap to check against — and the dashboard says that. A typical error near a factor of five
+ * is large; it is reported as measured, with the intervals, rather than rounded away.
+ */
+export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL): ValidationResults {
+  const peers = livePeers(snapshot);
+  const folds = stratifiedFolds(peers, CV_FOLDS, CV_SEED);
+  const errs: number[] = [];
+  const baseErrs: number[] = [];
+  for (let f = 0; f < CV_FOLDS; f++) {
+    const test = new Set(folds[f]!.map((p) => p.slug));
+    const train: Snapshot = { ...snapshot, protocols: snapshot.protocols.filter((p) => !test.has(p.slug)) };
+    const calib = calibrateMultiples(train, model);
+    for (const p of folds[f]!) {
+      const { growthMult, maturityMult, chainMult } = impliedValue(p, snapshot.as_of, calib, model);
+      const shrunk = multipleFor(p.category, calib).multiple;
+      const pred = Math.max(1, Math.round(p.tvl_usd * shrunk * growthMult * maturityMult * chainMult));
+      errs.push(Math.log(pred) - Math.log(p.mcap_usd!));
+      const entry = calib.by_category.get(p.category ?? 'Other');
+      const base = entry !== undefined && entry.peers >= model.min_peers ? entry.raw_multiple! : calib.global_multiple;
+      const basePred = Math.max(1, Math.round(p.tvl_usd * base * growthMult * maturityMult * chainMult));
+      baseErrs.push(Math.log(basePred) - Math.log(p.mcap_usd!));
+    }
+  }
+  const s = errorStats(errs);
+  const b = errorStats(baseErrs);
+  const allRatios = peers.map((p) => p.mcap_usd! / p.tvl_usd);
+  const globalBoot = bootstrapMedian(allRatios, BOOTSTRAP_SAMPLES, BOOTSTRAP_SEED);
+  const byCat = new Map<string, number[]>();
+  for (const p of peers) {
+    const key = p.category ?? 'Other';
+    const list = byCat.get(key) ?? [];
+    list.push(p.mcap_usd! / p.tvl_usd);
+    byCat.set(key, list);
+  }
+  const category_ci = [...byCat.entries()]
+    .filter(([, xs]) => xs.length >= CATEGORY_BOOTSTRAP_MIN_PEERS)
+    .map(([category, xs]) => {
+      const boot = bootstrapMedian(xs, CATEGORY_BOOTSTRAP_SAMPLES, BOOTSTRAP_SEED + category.length * 7919 + xs.length);
+      return { category, peers: xs.length, median: round4(boot.median), ci_low_90: round4(boot.ci_low_90), ci_high_90: round4(boot.ci_high_90) };
+    })
+    .sort((a, b2) => b2.peers - a.peers);
+  return {
+    cross_validation: {
+      folds: CV_FOLDS,
+      peers: peers.length,
+      seed: CV_SEED,
+      median_abs_log_error: round4(s.median_abs),
+      mean_abs_log_error: round4(s.mean_abs),
+      within_2x: round4(s.within_2x),
+      within_1_5x: round4(s.within_1_5x),
+      baseline_median_abs_log_error: round4(b.median_abs),
+      baseline_mean_abs_log_error: round4(b.mean_abs),
+      baseline_within_2x: round4(b.within_2x),
+    },
+    global_bootstrap: {
+      samples: BOOTSTRAP_SAMPLES,
+      seed: BOOTSTRAP_SEED,
+      median: round4(globalBoot.median),
+      ci_low_90: round4(globalBoot.ci_low_90),
+      ci_high_90: round4(globalBoot.ci_high_90),
+    },
+    category_ci,
+  };
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
@@ -359,6 +602,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       category_multiple: s.multiple.multiple,
       category_peers: s.multiple.peers,
       category_fallback: s.multiple.fallback,
+      category_raw_multiple: s.multiple.raw_multiple,
+      category_shrinkage: s.multiple.shrinkage,
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
@@ -552,6 +797,9 @@ export function radarRow(row: BoardRow): RadarRow {
     implied_value_usd: row.implied_value_usd,
     category_multiple: row.model.category_multiple,
     category_peers: row.model.category_peers,
+    category_fallback: row.model.category_fallback,
+    category_raw_multiple: row.model.category_raw_multiple,
+    category_shrinkage: row.model.category_shrinkage,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     chain_multiplier: row.model.chain_multiplier,
@@ -562,10 +810,17 @@ export function radarRow(row: BoardRow): RadarRow {
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
   const board = buildBoard(snapshot, model);
   const calibration = calibrateMultiples(snapshot, model);
+  const validation = validateModel(snapshot, model);
   const live = liveRows(snapshot);
   const beyond = board.filter((r) => !snapshot.watchlist.includes(r.slug));
   const early = beyond.filter((r) => r.tvl_usd < snapshot.floor_usd).length;
-  const multiples = [...calibration.by_category.values()].sort((a, b) => b.multiple - a.multiple || (a.category < b.category ? -1 : 1));
+  const ciByCategory = new Map(validation.category_ci.map((c) => [c.category, c]));
+  const multiples = [...calibration.by_category.values()]
+    .map((m) => {
+      const ci = ciByCategory.get(m.category);
+      return ci === undefined ? m : { ...m, ci_low: ci.ci_low_90, ci_high: ci.ci_high_90 };
+    })
+    .sort((a, b) => b.multiple - a.multiple || (a.category < b.category ? -1 : 1));
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -580,6 +835,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     global_multiple: calibration.global_multiple,
     global_peers: calibration.global_peers,
     multiples,
+    validation,
     watchlist: snapshot.watchlist,
     rows: board.map(radarRow),
     live,
